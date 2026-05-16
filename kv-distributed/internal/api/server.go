@@ -188,6 +188,13 @@ func (s *KVServer) ListKeysInRange(req Request, resp *Response) error {
 	return nil
 }
 
+func (s *KVServer) ScanKeys(req Request, resp *Response) error {
+	keys, nextCursor := s.service.ScanKeys(req.Bucket, req.Cursor, req.Count)
+	resp.Keys = keys
+	resp.NextCursor = nextCursor
+	return nil
+}
+
 func (s *KVServer) SetAdd(req Request, resp *Response) error {
 	s.service.SetAdd(req.SetName, req.ValueStr)
 	resp.Message = "OK"

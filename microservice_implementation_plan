@@ -1,0 +1,44 @@
+# Flash Sale Microservice: Architecture & Verification Plan
+
+Before we write a single line of code, here is exactly why the **Flash Sale Engine** is the ultimate proof that Hrux-DB is a production-ready database, and exactly how we will use the external application to test every single feature.
+
+## Why is a Flash Sale the "Best Fit"?
+A Flash Sale (e.g., 10,000 people trying to buy 500 iPhones at the exact same second) is the hardest problem in database engineering. 
+- **SQL databases fail** because 10,000 queries try to update the exact same `inventory` row, causing a "Row Lock" bottleneck that crashes the server.
+- **Pure caches fail** because if the server loses power mid-sale, the financial inventory data is wiped out.
+- **Redis bottlenecks** because it processes all 10,000 requests in a single-file line on one CPU core.
+
+By building an external Node.js application that runs a Flash Sale, we prove that **Hrux-DB solves all these problems simultaneously.**
+
+---
+
+## Feature Testing Matrix (The "Big One")
+We will create a separate folder called `microservice-flashsale`. It will use our new `hrux-client.js` SDK to communicate with Hrux-DB. Here is how the microservice will explicitly prove **every single feature** of Hrux-DB:
+
+| Hrux-DB Feature | How the Microservice Tests & Proves It |
+| :--- | :--- |
+| **1. In-Memory Speed** | We will show a live throughput graph. Because it's purely in-memory, the graph will show Hrux-DB effortlessly handling thousands of operations per second with microsecond latency, dwarfing SQL's capabilities. |
+| **2. Concurrency (Sharding)** | We will write a "Load Test Script" that blasts the microservice with thousands of parallel `/buy` requests. Hrux-DB will route these across its 256 shards, utilizing your entire CPU without locking up. |
+| **3. Crash Recovery** | During the live load test, we will physically kill the Hrux-DB server (`Ctrl+C`). When we restart it, the microservice will immediately resume, proving the inventory count didn't lose a single item. |
+| **4. Durability (WAL)** | The master `inventory_count` is what guarantees crash recovery. We will show the `.wal` file actively growing as purchases happen. |
+| **5. Auto-Compaction** | As the load test hits 100,000 operations, we will watch the massive WAL file automatically shrink itself into a clean snapshot without interrupting the sale! |
+| **6. Real-Time (Pub/Sub)** | Every time an item is successfully purchased, the microservice calls `db.publish()`. A Live Admin Dashboard will subscribe to this and show a real-time scrolling feed of purchases. |
+| **7. TTL (Time-To-Live)** | When a user clicks "Add to Cart", the microservice stores a `cart_reservation` key with a **300-second TTL**. If they don't buy in 5 minutes, Hrux-DB auto-deletes the reservation and frees up inventory. |
+| **8. Sets (Unique Data)** | We use a Hrux-DB `Set` to store `buyer_ids`. This guarantees that even if a user's browser glitches and sends 50 duplicate requests, they can only buy the item once. |
+| **9. Queues (Waitlists)** | Once inventory hits 0, users who try to buy are automatically `pushed` onto a Hrux-DB `Queue` to form a perfectly ordered Waitlist. |
+| **10. Safe Iteration (SCAN)** | The Admin Dashboard will use the `SCAN` command to safely scroll through the list of active cart sessions without freezing the database. |
+
+---
+
+## Execution Plan
+
+1. **Create Backend Microservice (`microservice-flashsale/server.js`)**: A Node.js Express API that handles the business logic (Cart, Buy, Waitlist) using the `hrux-client.js` SDK.
+2. **Create Load Generator (`microservice-flashsale/load-test.js`)**: A script to simulate 5,000 desperate buyers hitting the API simultaneously.
+3. **Create Live Dashboard (`microservice-flashsale/public/index.html`)**: A visually stunning frontend that displays the live throughput graph, the live inventory dropping, and the live Pub/Sub event feed.
+
+## User Review Required
+
+> [!IMPORTANT]
+> The table above now explicitly covers all 10 major features (including Speed, Crash Recovery, Compaction, and SCAN) in a single, massive demonstration. 
+> 
+> Is this exactly what you need to blow the evaluators away? If so, I will begin writing the Node.js server!

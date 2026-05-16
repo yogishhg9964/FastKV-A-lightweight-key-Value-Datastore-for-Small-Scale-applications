@@ -1,0 +1,64 @@
+# Go build artifacts
+*.o
+*.a
+*.so
+.DS_Store
+bin/
+dist/
+build/
+
+# Go binaries
+/kv-distributed/cmd/server/server
+/kv-distributed/cmd/client/client
+/kv-distributed/cmd/http-server/http-server
+
+# Go modules
+go.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.env.local
+.env.*.local
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+build/
+.next/
+out/
+
+# Frontend build
+kv-frontend/dist/
+kv-frontend/build/
+
+# Runtime generated files
+*.wal
+*.gob
+*.db
+*.sqlite
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+
+# Package files
+*.tar.gz
+*.zip
+
+# Test coverage
+coverage/
+*.out
+
+# Environment files
+.env
+.env.local
+.env.*.local

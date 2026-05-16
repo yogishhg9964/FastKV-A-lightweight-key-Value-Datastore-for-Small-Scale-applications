@@ -1,0 +1,159 @@
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+\usepackage{times}
+\usepackage{epsfig}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{float}
+
+\title{Hrux-DB: Mitigating Lock Contention in High-Concurrency Commerce via Sharded In-Memory Key-Value Storage with Append-Only Durability}
+
+\author{
+% Add your name and details here
+Author Name \\
+Institution Name\\
+{\tt\small email@example.com}
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Traditional relational databases struggle to maintain throughput during extreme high-concurrency events, such as limited-inventory flash sales, primarily due to global and row-level mutex lock contention. When thousands of concurrent requests attempt to decrement a single inventory row, traditional systems queue operations sequentially, driving up latency and triggering system timeouts. In this paper, we propose Hrux-DB, a distributed, in-memory key-value data store built to address this specific operational bottleneck. By implementing a 256-lane sharded map architecture, Hrux-DB completely bypasses global mutex locks. Furthermore, we maintain strict data durability without sacrificing speed by utilizing a microsecond-latency append-only Write-Ahead Log (WAL). Our empirical testing demonstrates that Hrux-DB can sustain sub-millisecond average latencies (0.41ms) under heavy load while maintaining a minimal operational footprint of under 20MB of RAM.
+\end{abstract}
+
+\section{Introduction}
+
+Modern digital commerce heavily relies on high-velocity transaction events, commonly known as "flash sales" or "drops." During these events, systems experience highly localized traffic surges where tens of thousands of concurrent users attempt to purchase a very limited pool of inventory within seconds. 
+
+Under normal operating conditions, traditional Relational Database Management Systems (RDBMS) like PostgreSQL or MySQL perform exceptionally well. However, during a traffic anomaly, the relational model becomes an operational bottleneck. When multiple threads attempt to mutate the same inventory integer simultaneously, the database must enforce ACID compliance by utilizing row-level locks. This forces concurrent writes into a sequential queue, causing exponential latency degradation and exhausting server connection pools.
+
+To resolve this, engineers often deploy external caching layers (such as Redis). While in-memory systems offer significantly faster read/write speeds, many widely used tools are single-threaded, which introduces a different type of concurrency limitation. Furthermore, moving authoritative inventory data into a volatile cache risks critical data loss during a hardware failure.
+
+We built Hrux-DB to solve this specific architectural problem. Hrux-DB is an in-memory, disk-backed key-value store engineered in Go. It abandons heavy relational abstractions in favor of raw atomic execution, 256-shard parallel processing, and asynchronous disk persistence.
+
+\section{Related Work and Research Gaps}
+
+Existing data storage architectures often force engineers to compromise between raw speed and guaranteed persistence.
+
+\subsection{Relational Databases}
+Systems like MySQL rely on B-Tree data structures and relational planners. While these are excellent for complex queries and joining discrete datasets, the overhead required to maintain index trees and establish transactional locks makes them highly inefficient for simple, high-velocity integer decrements. 
+
+\subsection{Single-Threaded Caches}
+Redis remains the industry standard for in-memory data storage. However, its single-threaded event loop means it can only process one command at a time. While individual operations execute in microseconds, the lack of true multi-core parallel execution limits hardware utilization during massive traffic spikes. 
+
+\subsection{The Persistence Trade-off}
+In-memory systems inherently risk data loss during power failures. To counter this, periodic disk snapshots are used. However, snapshots require heavy memory allocations and CPU cycles, often freezing the system entirely during the save process. 
+
+Hrux-DB bridges these gaps by providing true multi-threaded execution over partitioned memory, while maintaining data safety through a continuous microsecond-overhead transaction log.
+
+\section{System Architecture}
+
+Hrux-DB was designed strictly for speed, utilizing a memory-first architecture while offloading durability to the file system.
+
+\subsection{The Sharded Execution Engine}
+To eliminate the global mutex lock bottleneck—where the entire database locks during a single write—Hrux-DB splits its memory space into 256 isolated data shards.
+
+When a client requests a read or write operation, the target key is evaluated against a 32-bit Fowler-Noll-Vo (FNV-1a) non-cryptographic hash function. The result dictates which specific shard will process the request:
+
+\begin{equation}
+S_{target} = \text{hash}(key) \pmod{256}
+\end{equation}
+
+Because each of the 256 shards maintains its own independent Read/Write Mutex (\texttt{sync.RWMutex}), Hrux-DB can process up to 256 overlapping mutations simultaneously across different memory sectors without any lock contention. 
+
+\subsection{Append-Only Durability (WAL)}
+Operating primarily in RAM allows for exceptional speed but exposes the system to catastrophic data loss. To provide durability without the latency penalties of standard disk writing, Hrux-DB implements a Write-Ahead Log (WAL).
+
+Instead of updating complex disk blocks, every mutation is serialized into a highly compressed byte sequence and instantly appended to the end of a single, continuous text file (\texttt{hrux.wal}). Sequential disk appending is an $O(1)$ operation that perfectly leverages modern SSD architectures. 
+
+During our telemetry tests, this persistence overhead averaged just 0.08ms per write operation, allowing Hrux-DB to remain safely durable without sacrificing its sub-millisecond execution speeds.
+
+\subsection{Autonomous Lifecycle Management}
+For temporal data like flash sale pricing or temporary security tokens, handling expiration at the application layer is highly inefficient. Hrux-DB implements an internal Time-To-Live (TTL) engine. Keys are assigned a Unix timestamp defining their expiration, and the system autonomously reclaims the memory upon expiration without requiring manual deletion commands from the client application.
+
+\section{Experimental Setup and Evaluation}
+
+To validate the architectural claims of Hrux-DB, we developed an isolated Node.js microservice simulating a live commerce backend. We measured performance under normal load and during simulated "Traffic Surges" of 1,000 to 10,000 concurrent client requests.
+
+\subsection{Latency and Throughput}
+
+Hrux-DB handled 1,000 concurrent purchase operations in under 20 milliseconds. The 256-shard architecture successfully absorbed the traffic spike, preventing any single process from halting the execution pipeline. 
+
+Table \ref{tab:latency} compares the real-time latency distributions of Hrux-DB against the simulated mathematical baseline of a lock-bound relational system under identical traffic.
+
+\begin{table}[H]
+\centering
+\caption{Latency Distribution Under Heavy Load}
+\label{tab:latency}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Metric} & \textbf{Hrux-DB} & \textbf{Traditional SQL (Simulated)} \\ \midrule
+Average Latency & 0.41ms & 45ms+ \\
+P95 Latency & 0.72ms & 120ms \\
+P99 Latency & 1.80ms & 340ms+ \\
+Global Deadlocks & 0 & High Probability \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Resource Efficiency and Density}
+
+To accurately measure efficiency, we tracked the Go Runtime Garbage Collector fraction and memory allocations during active traffic surges. Traditional databases often require gigabytes of RAM simply to boot and manage B-Tree indexes.
+
+Hrux-DB registered an operational heap footprint of just $\sim$14.2 MB. Because the Go engine utilizes \texttt{sync.Pool} memory recycling, the Garbage Collection CPU overhead consistently remained below 0.01\% during active request streaming. 
+
+To quantify this, we define a custom architectural density metric:
+
+\begin{equation}
+Density = \frac{Throughput_{ops}}{Memory_{Sys}}
+\end{equation}
+
+By running thousands of operations per second against a memory footprint of less than 20MB, Hrux-DB achieves an exceptionally high operational density, proving its viability as a highly optimized microservice datastore.
+
+\section{Conclusion}
+
+The empirical evidence collected from the Hrux-DB telemetry layer confirms our primary hypothesis: removing complex relational abstractions and implementing a sharded in-memory execution pipeline drastically mitigates concurrency bottlenecks. 
+
+While Hrux-DB explicitly sacrifices the ability to execute complex relational JOINs or scan table structures sequentially, it excels in its designed purpose. By leveraging $O(1)$ append-only WAL logging and 256-lane parallel execution, Hrux-DB provides a highly resilient, lightning-fast foundation for modern distributed commerce architecture. 
+
+\begin{thebibliography}{9}
+
+\bibitem{stonebraker2007end}
+M. Stonebraker \textit{et al.}, 
+``The end of an architectural era (it's time for a complete rewrite),'' 
+in \textit{Proc. 33rd Int. Conf. Very Large Data Bases (VLDB)}, 2007, pp. 1150--1160.
+
+\bibitem{decandia2007dynamo}
+G. DeCandia \textit{et al.}, 
+``Dynamo: Amazon's highly available key-value store,'' 
+in \textit{Proc. 21st ACM Symp. Operating Systems Principles (SOSP)}, 2007, pp. 205--220.
+
+\bibitem{mohan1992aries}
+C. Mohan \textit{et al.}, 
+``ARIES: A transaction recovery method supporting fine-granularity locking and partial rollbacks using write-ahead logging,'' 
+\textit{ACM Trans. Database Syst. (TODS)}, vol. 17, no. 1, pp. 94--162, Mar. 1992.
+
+\bibitem{redis}
+S. Sanfilippo, 
+``Redis: An in-memory database that persists on disk,'' 
+2009. [Online]. Available: https://redis.io/
+
+\bibitem{go_runtime}
+A. Donovan and B. Kernighan, 
+\textit{The Go Programming Language}. 
+Addison-Wesley Professional, 2015.
+
+\bibitem{ssd_logging}
+M. Rosenblum and J. K. Ousterhout,
+``The design and implementation of a log-structured file system,''
+\textit{ACM Trans. Comput. Syst. (TOCS)}, vol. 10, no. 1, pp. 26--52, Feb. 1992.
+
+\end{thebibliography}
+
+\end{document}

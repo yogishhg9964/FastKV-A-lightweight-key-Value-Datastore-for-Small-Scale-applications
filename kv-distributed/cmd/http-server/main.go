@@ -4,18 +4,26 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"sort"
-	"sync"
-	"time"
+	"os"
+	"os/signal"
+	"runtime"
+	"sync/atomic"
+	"syscall"
+
+	"kv-distributed/internal/datastructures"
+	"kv-distributed/internal/indexing"
+	"kv-distributed/internal/service"
+	"kv-distributed/internal/storage"
 )
 
-/* ===================== CORS ===================== */
+var opsCounter uint64
 
 func cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&opsCounter, 1)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -25,7 +33,33 @@ func cors(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-/* ===================== TYPES ===================== */
+func auth(next http.HandlerFunc) http.HandlerFunc {
+	expectedKey := os.Getenv("HRUX_API_KEY")
+	if expectedKey == "" {
+		expectedKey = "hrux_dev_key_123"
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		queryKey := r.URL.Query().Get("apikey")
+
+		var token string
+		if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+			token = authHeader[7:]
+		} else if queryKey != "" {
+			token = queryKey
+		}
+
+		if token != expectedKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "Unauthorized: Invalid API Key"})
+			return
+		}
+
+		next(w, r)
+	}
+}
 
 type KVRequest struct {
 	Bucket string `json:"bucket,omitempty"`
@@ -41,319 +75,264 @@ type KVRequest struct {
 
 	QueueName string `json:"queueName,omitempty"`
 	StackName string `json:"stackName,omitempty"`
-}
 
-type TransactionRequest struct {
-	Operations []TransactionOp `json:"operations"`
-}
-
-type TransactionOp struct {
-	Action string `json:"action"`
-	Bucket string `json:"bucket"`
-	Key    string `json:"key"`
-	Value  string `json:"value,omitempty"`
+	Cursor int `json:"cursor,omitempty"`
+	Count  int `json:"count,omitempty"`
 }
 
 type KVResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
+	Success    bool        `json:"success"`
+	Data       interface{} `json:"data,omitempty"`
+	Error      string      `json:"error,omitempty"`
+	NextCursor int         `json:"nextCursor,omitempty"`
 }
-
-/* ===================== STORAGE ===================== */
-
-type Item struct {
-	Value     string
-	ExpiresAt time.Time
-}
-
-var (
-	// KV
-	data = make(map[string]map[string]Item)
-
-	// Data structures
-	sets        = make(map[string]map[string]bool)
-	sortedLists = make(map[string][]string)
-	mapsStore   = make(map[string]map[string]string)
-	queues      = make(map[string][]string)
-	stacks      = make(map[string][]string)
-
-	// Locks
-	dataMux   sync.RWMutex
-	setsMux   sync.RWMutex
-	sortedMux sync.RWMutex
-	mapMux    sync.RWMutex
-	queueMux  sync.RWMutex
-	stackMux  sync.RWMutex
-)
-
-/* ===================== HELPERS ===================== */
-
-func expired(item Item) bool {
-	return !item.ExpiresAt.IsZero() && time.Now().After(item.ExpiresAt)
-}
-
-/* ===================== MAIN ===================== */
 
 func main() {
+	// Initialize core engine
+	store := storage.NewStorage()
+	idx := indexing.NewIndexer()
+	ds := datastructures.NewDataStructuresService()
+	kvService := service.NewKVService(store, idx, ds)
 
-	/* ---------- HEALTH ---------- */
+	// Attempt to load from WAL
+	if err := kvService.LoadFromFile("hrux.wal"); err != nil {
+		log.Println("Could not load WAL (might be first run):", err)
+	} else {
+		log.Println("WAL loaded successfully")
+	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		kvService.Stop()
+		os.Exit(0)
+	}()
+
 	http.HandleFunc("/health", cors(func(w http.ResponseWriter, _ *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}))
 
-	/* ---------- KV PUT ---------- */
-	http.HandleFunc("/put", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/metrics", cors(func(w http.ResponseWriter, _ *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		walWrites, walBytes, walLatNs := store.GetWALMetrics()
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"heapAllocMB": float64(m.Alloc) / 1024.0 / 1024.0,
+			"sysMB":       float64(m.Sys) / 1024.0 / 1024.0,
+			"numGC":       m.NumGC,
+			"gcCPUFract":  m.GCCPUFraction,
+			"totalOps":    atomic.LoadUint64(&opsCounter),
+			"activeLanes": 256, // Demonstrating the Sharded Map lanes
+			"walWrites":   walWrites,
+			"walBytes":    walBytes,
+			"walLatNs":    walLatNs,
+		})
+	}))
+
+	http.HandleFunc("/put", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
-
+		
 		if req.Bucket == "" || req.Key == "" {
 			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "bucket & key required"})
 			return
 		}
 
-		dataMux.Lock()
-		if data[req.Bucket] == nil {
-			data[req.Bucket] = make(map[string]Item)
-		}
-
-		item := Item{Value: req.Value}
 		if req.TTL > 0 {
-			item.ExpiresAt = time.Now().Add(time.Second * time.Duration(req.TTL))
+			kvService.PutWithTTL(req.Bucket, req.Key, []byte(req.Value), req.TTL)
+		} else {
+			kvService.Put(req.Bucket, req.Key, []byte(req.Value))
 		}
-
-		data[req.Bucket][req.Key] = item
-		dataMux.Unlock()
-
 		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
+	})))
 
-	/* ---------- KV GET ---------- */
-	http.HandleFunc("/get", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/get", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		dataMux.Lock()
-		defer dataMux.Unlock()
-
-		item, ok := data[req.Bucket][req.Key]
-		if !ok || expired(item) {
-			delete(data[req.Bucket], req.Key)
-			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "not found"})
+		val, err := kvService.Get(req.Bucket, req.Key)
+		if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
 			return
 		}
+		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: string(val)})
+	})))
 
-		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: item.Value})
-	}))
-
-	/* ---------- KV LIST ---------- */
-	http.HandleFunc("/list", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/delete", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		result := map[string]string{}
-
-		dataMux.Lock()
-		for k, v := range data[req.Bucket] {
-			if !expired(v) {
-				result[k] = v.Value
-			}
+		err := kvService.Delete(req.Bucket, req.Key)
+		if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
 		}
-		dataMux.Unlock()
-
-		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: result})
-	}))
-
-	/* ---------- KV DELETE ---------- */
-	http.HandleFunc("/delete", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		dataMux.Lock()
-		delete(data[req.Bucket], req.Key)
-		dataMux.Unlock()
-
 		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
+	})))
 
-	/* ---------- SET ---------- */
-	http.HandleFunc("/set/add", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/list", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
 
-		setsMux.Lock()
-		if sets[req.SetName] == nil {
-			sets[req.SetName] = make(map[string]bool)
+		data, err := kvService.List(req.Bucket)
+		if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
 		}
-		sets[req.SetName][req.ValueStr] = true
-		setsMux.Unlock()
-
-		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
-
-	http.HandleFunc("/set/remove", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		setsMux.Lock()
-		delete(sets[req.SetName], req.ValueStr)
-		setsMux.Unlock()
-
-		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
-
-	http.HandleFunc("/set/list", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		var list []string
-		setsMux.RLock()
-		for v := range sets[req.SetName] {
-			list = append(list, v)
+		
+		strData := make(map[string]string)
+		for k, v := range data {
+			strData[k] = string(v)
 		}
-		setsMux.RUnlock()
+		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: strData})
+	})))
 
+	http.HandleFunc("/scan", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+
+		keys, nextCursor := kvService.ScanKeys(req.Bucket, req.Cursor, req.Count)
+		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: keys, NextCursor: nextCursor})
+	})))
+
+	http.HandleFunc("/set/add", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		kvService.SetAdd(req.SetName, req.ValueStr)
+		json.NewEncoder(w).Encode(KVResponse{Success: true})
+	})))
+    
+	http.HandleFunc("/set/list", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		list, err := kvService.SetList(req.SetName)
+        if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
+		}
 		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: list})
-	}))
+	})))
 
-	/* ---------- SORTED LIST ---------- */
-	http.HandleFunc("/sortedlist/add", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/sortedlist/add", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
-
-		sortedMux.Lock()
-		sortedLists[req.ListName] = append(sortedLists[req.ListName], req.ValueStr)
-		sort.Strings(sortedLists[req.ListName])
-		sortedMux.Unlock()
-
+		kvService.SortedListAdd(req.ListName, req.ValueStr)
 		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
+	})))
 
-	http.HandleFunc("/sortedlist/get", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/sortedlist/get", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
-
-		sortedMux.RLock()
-		list := sortedLists[req.ListName]
-		sortedMux.RUnlock()
-
+		list, err := kvService.SortedListGet(req.ListName)
+        if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
+		}
 		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: list})
-	}))
+	})))
 
-	/* ---------- MAP ---------- */
-	http.HandleFunc("/map/put", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/map/put", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
+		kvService.MapPut(req.MapName, req.Key, req.ValueStr)
+		json.NewEncoder(w).Encode(KVResponse{Success: true})
+	})))
 
-		mapMux.Lock()
-		if mapsStore[req.MapName] == nil {
-			mapsStore[req.MapName] = make(map[string]string)
+	http.HandleFunc("/map/get", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		val, err := kvService.MapGet(req.MapName, req.Key)
+        if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
 		}
-		mapsStore[req.MapName][req.Key] = req.ValueStr
-		mapMux.Unlock()
-
-		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
-
-	http.HandleFunc("/map/get", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		mapMux.RLock()
-		val := mapsStore[req.MapName][req.Key]
-		mapMux.RUnlock()
-
 		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: val})
-	}))
+	})))
 
-	/* ---------- QUEUE ---------- */
-	http.HandleFunc("/queue/push", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/queue/push", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
-
-		queueMux.Lock()
-		queues[req.QueueName] = append(queues[req.QueueName], req.ValueStr)
-		queueMux.Unlock()
-
+		kvService.QueuePush(req.QueueName, req.ValueStr)
 		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
+	})))
 
-	http.HandleFunc("/queue/pop", cors(func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/queue/pop", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		var req KVRequest
 		json.NewDecoder(r.Body).Decode(&req)
+		val, err := kvService.QueuePop(req.QueueName)
+        if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: val})
+	})))
 
-		queueMux.Lock()
-		defer queueMux.Unlock()
+	http.HandleFunc("/stack/push", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		kvService.StackPush(req.StackName, req.ValueStr)
+		json.NewEncoder(w).Encode(KVResponse{Success: true})
+	})))
 
-		q := queues[req.QueueName]
-		if len(q) == 0 {
-			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "empty"})
+	http.HandleFunc("/stack/pop", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		val, err := kvService.StackPop(req.StackName)
+        if err != nil {
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: val})
+	})))
+
+	http.HandleFunc("/publish", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		var req KVRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		
+		if req.Bucket == "" { // Using Bucket field as channel name
+			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "channel (bucket field) required"})
+			return
+		}
+		kvService.Publish(req.Bucket, req.Value)
+		json.NewEncoder(w).Encode(KVResponse{Success: true})
+	})))
+
+	http.HandleFunc("/subscribe", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		channel := r.URL.Query().Get("channel")
+		if channel == "" {
+			http.Error(w, "channel query parameter is required", http.StatusBadRequest)
 			return
 		}
 
-		val := q[0]
-		queues[req.QueueName] = q[1:]
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
 
-		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: val})
-	}))
-
-	/* ---------- STACK ---------- */
-	http.HandleFunc("/stack/push", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		stackMux.Lock()
-		stacks[req.StackName] = append(stacks[req.StackName], req.ValueStr)
-		stackMux.Unlock()
-
-		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
-
-	http.HandleFunc("/stack/pop", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req KVRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		stackMux.Lock()
-		defer stackMux.Unlock()
-
-		s := stacks[req.StackName]
-		if len(s) == 0 {
-			json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "empty"})
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 			return
 		}
 
-		val := s[len(s)-1]
-		stacks[req.StackName] = s[:len(s)-1]
+		msgChan := kvService.Subscribe(channel)
+		defer kvService.Unsubscribe(channel, msgChan)
 
-		json.NewEncoder(w).Encode(KVResponse{Success: true, Data: val})
-	}))
+		notify := r.Context().Done()
 
-	/* ---------- TRANSACTION ---------- */
-	http.HandleFunc("/transaction", cors(func(w http.ResponseWriter, r *http.Request) {
-		var req TransactionRequest
-		json.NewDecoder(r.Body).Decode(&req)
-
-		dataMux.Lock()
-		defer dataMux.Unlock()
-
-		for _, op := range req.Operations {
-			switch op.Action {
-			case "put":
-				if data[op.Bucket] == nil {
-					data[op.Bucket] = make(map[string]Item)
-				}
-				data[op.Bucket][op.Key] = Item{Value: op.Value}
-			case "delete":
-				delete(data[op.Bucket], op.Key)
-			default:
-				json.NewEncoder(w).Encode(KVResponse{Success: false, Error: "invalid op"})
+		for {
+			select {
+			case <-notify:
 				return
+			case msg := <-msgChan:
+				w.Write([]byte("data: " + msg + "\n\n"))
+				flusher.Flush()
 			}
 		}
+	})))
 
-		json.NewEncoder(w).Encode(KVResponse{Success: true})
-	}))
-
-	log.Println("🚀 HTTP KV Server running on :8081")
+	log.Println("🚀 Hrux-DB HTTP Engine running on :8081 (Sharded + WAL + PubSub)")
 	log.Fatal(http.ListenAndServe(":8081", nil))
 }

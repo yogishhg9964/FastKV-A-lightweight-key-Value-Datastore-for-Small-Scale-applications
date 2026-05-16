@@ -16,6 +16,8 @@ type Request struct {
 	End         string          `json:"end,omitempty"`
 	ValueStr    string          `json:"valueStr,omitempty"`
 	Transaction []TransactionOp `json:"transaction,omitempty"`
+	Cursor      int             `json:"cursor,omitempty"`
+	Count       int             `json:"count,omitempty"`
 }
 
 type Response struct {
@@ -24,8 +26,9 @@ type Response struct {
 	Keys    []string          `json:"keys,omitempty"`
 	List    []string          `json:"list,omitempty"`
 	Data    interface{}       `json:"data,omitempty"`
-	Message string            `json:"message,omitempty"`
-	Errors  []error           `json:"errors,omitempty"`
+	Message    string            `json:"message,omitempty"`
+	Errors     []error           `json:"errors,omitempty"`
+	NextCursor int               `json:"nextCursor,omitempty"`
 }
 
 type TransactionOp struct {

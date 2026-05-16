@@ -12,6 +12,7 @@ type KVService struct {
 	storage     *storage.Storage
 	indexer     *indexing.Indexer
 	dataStructs *datastructures.DataStructuresService
+	pubsub      *PubSub
 	stopTTL     chan bool
 }
 
@@ -20,6 +21,7 @@ func NewKVService(storage *storage.Storage, indexer *indexing.Indexer, dataStruc
 		storage:     storage,
 		indexer:     indexer,
 		dataStructs: dataStructs,
+		pubsub:      NewPubSub(),
 		stopTTL:     make(chan bool),
 	}
 
@@ -84,6 +86,26 @@ func (s *KVService) ListKeysInRange(bucket, start, end string) ([]string, error)
 	return s.indexer.ListKeysInRange(data, start, end), nil
 }
 
+func (s *KVService) ScanKeys(bucket string, cursor int, count int) ([]string, int) {
+	if count <= 0 {
+		count = 10 // Default count
+	}
+	
+	var keys []string
+	currentShard := cursor
+	
+	for currentShard < 256 && len(keys) < count {
+		shardKeys := s.storage.ScanShard(bucket, currentShard)
+		keys = append(keys, shardKeys...)
+		currentShard++
+	}
+	
+	if currentShard >= 256 {
+		return keys, 0
+	}
+	return keys, currentShard
+}
+
 func (s *KVService) SetAdd(setName, value string) {
 	s.dataStructs.SetAdd(setName, value)
 }
@@ -144,4 +166,16 @@ func (s *KVService) SaveToFile(filename string) error {
 func (s *KVService) LoadFromFile(filename string) error {
 	s.storage.SetPersistenceFile(filename)
 	return s.storage.LoadFromFile()
+}
+
+func (s *KVService) Subscribe(channel string) chan string {
+	return s.pubsub.Subscribe(channel)
+}
+
+func (s *KVService) Unsubscribe(channel string, ch chan string) {
+	s.pubsub.Unsubscribe(channel, ch)
+}
+
+func (s *KVService) Publish(channel string, message string) {
+	s.pubsub.Publish(channel, message)
 }
